@@ -3,7 +3,6 @@ import socket
 import eventlet
 eventlet.monkey_patch()
 
-from concurrent.futures import ThreadPoolExecutor
 from openpyxl import Workbook
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
@@ -148,55 +147,8 @@ def check_email_smtp(email):
             return 'error', error_msg
 
 
-def check_single_email(email, index, total):
-    """Check a single email and emit results"""
-    global processing_stats
-
-    # Update current processing info
-    processing_stats['current'] = index + 1
-    processing_stats['current_email'] = email
-
-    # Emit progress update
-    with threading.Lock():
-        socketio.emit('progress', {
-            'current': processing_stats['current'],
-            'total': processing_stats['total'],
-            'currentEmail': email,
-            'percentage': round((processing_stats['current'] / processing_stats['total']) * 100, 1)
-        })
-
-    # Check the email
-    status, message = check_email_smtp(email)
-
-    # Store result
-    result = {
-        'email': email,
-        'status': status,
-        'message': message,
-        'timestamp': time.time()
-    }
-
-    # Add to appropriate list
-    if status == 'valid':
-        valid_emails.append(result)
-        processing_stats['valid_count'] += 1
-    elif status == 'bounced':
-        bounced_emails.append(result)
-        processing_stats['bounced_count'] += 1
-    else:
-        error_emails.append(result)
-        processing_stats['error_count'] += 1
-
-    # Emit result to frontend
-    with threading.Lock():
-        socketio.emit('result', result)
-
-    # Small delay to prevent overwhelming the server
-    time.sleep(0.1)
-
-
-def process_emails_threaded(emails):
-    """Process emails using thread pool"""
+def process_emails_synchronously(emails):
+    """Process emails one by one synchronously for consistent results"""
     global processing_stats
 
     processing_stats['is_processing'] = True
@@ -206,24 +158,57 @@ def process_emails_threaded(emails):
     processing_stats['bounced_count'] = 0
     processing_stats['error_count'] = 0
 
-    # This ensures that the memory is cleared even if multiple threads are used — preventing cross-run pollution.
-    with threading.Lock():
-        valid_emails[:] = []
-        bounced_emails[:] = []
-        error_emails[:] = []
+    # Clear previous results
+    valid_emails[:] = []
+    bounced_emails[:] = []
+    error_emails[:] = []
 
-    # Use ThreadPoolExecutor for concurrent processing
-    # Reduced workers to be respectful
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = []
-        for index, email in enumerate(emails):
-            future = executor.submit(
-                check_single_email, email, index, len(emails))
-            futures.append(future)
+    print(f"🚀 Starting synchronous processing of {len(emails)} emails...")
+    
+    # Process emails one by one
+    for index, email in enumerate(emails):
+        # Update current processing info
+        processing_stats['current'] = index + 1
+        processing_stats['current_email'] = email
+        
+        print(f"📧 Processing {index + 1}/{len(emails)}: {email}")
 
-        # Wait for all threads to complete
-        for future in futures:
-            future.result()
+        # Emit progress update
+        socketio.emit('progress', {
+            'current': processing_stats['current'],
+            'total': processing_stats['total'],
+            'currentEmail': email,
+            'percentage': round((processing_stats['current'] / processing_stats['total']) * 100, 1)
+        })
+
+        # Check the email
+        status, message = check_email_smtp(email)
+        print(f"   Result: {status} - {message}")
+
+        # Store result
+        result = {
+            'email': email,
+            'status': status,
+            'message': message,
+            'timestamp': time.time()
+        }
+
+        # Add to appropriate list
+        if status == 'valid':
+            valid_emails.append(result)
+            processing_stats['valid_count'] += 1
+        elif status == 'bounced':
+            bounced_emails.append(result)
+            processing_stats['bounced_count'] += 1
+        else:
+            error_emails.append(result)
+            processing_stats['error_count'] += 1
+
+        # Emit result to frontend
+        socketio.emit('result', result)
+
+        # Add a small delay between requests to be respectful to SMTP servers
+        time.sleep(0.5)
 
     processing_stats['is_processing'] = False
     processing_stats['current_email'] = 'Completed!'
@@ -279,7 +264,7 @@ def upload_emails():
 
         # Start processing in background
         socketio.start_background_task(
-            target=process_emails_threaded, emails=unique_emails)
+            target=process_emails_synchronously, emails=unique_emails)
 
         return jsonify({
             'message': 'Processing started',
@@ -294,17 +279,17 @@ def upload_emails():
 
 @app.route('/api/download/<category>')
 def download_results(category):
-    """Download results as plain .txt file containing only emails"""
+    """Download results as .txt file containing only emails"""
     try:
         if category == 'valid':
             data = valid_emails
-            filename = 'valid_gmail_emails.txt'
+            filename = 'valid_emails.txt'
         elif category == 'bounced':
             data = bounced_emails
-            filename = 'bounced_gmail_emails.txt'
+            filename = 'bounced_emails.txt'
         elif category == 'error':
             data = error_emails
-            filename = 'error_gmail_emails.txt'
+            filename = 'error_emails.txt'
         else:
             return jsonify({'error': 'Invalid category'}), 400
 
@@ -365,8 +350,9 @@ if __name__ == '__main__':
     import eventlet.wsgi
     eventlet.monkey_patch()
     
-    print("Starting Gmail Email Checker Server...")
+    print("Starting Gmail Email Checker Server (Synchronous Mode)...")
     print("Frontend should be running on http://localhost:5173")
     print("Backend API running on http://localhost:5000")
+    print("📧 Processing emails synchronously for consistent results")
     
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)
