@@ -14,6 +14,8 @@ import os
 import smtplib
 import dns.resolver
 import time
+from concurrent.futures import ThreadPoolExecutor
+import queue
 
 
 app = Flask(__name__)
@@ -40,6 +42,10 @@ MAX_RETRIES = 3
 INITIAL_WAIT_TIME = 2
 BACKOFF_BASE = 1.5
 TIMEOUT = 10
+
+# Controlled concurrency settings
+MAX_WORKERS = 3  # Limited workers for stability
+REQUEST_DELAY = 1.0  # Longer delay between batches
 
 # Gmail-only validation
 ALLOWED_DOMAINS = ['gmail.com']
@@ -229,6 +235,115 @@ def process_emails_synchronously(emails):
     print("Sum:", processing_stats['valid_count'] + processing_stats['bounced_count'] + processing_stats['error_count'])
 
 
+def check_single_email_controlled(email):
+    """Check a single email with controlled timing"""
+    try:
+        # Add staggered delay to prevent overwhelming the server
+        time.sleep(REQUEST_DELAY)
+        return check_email_smtp(email)
+    except Exception as e:
+        return 'error', f"⚠️ Processing error: {str(e)[:50]}"
+
+
+def process_emails_controlled_concurrency(emails):
+    """Process emails with controlled concurrency (3 workers max)"""
+    global processing_stats
+
+    processing_stats['is_processing'] = True
+    processing_stats['total'] = len(emails)
+    processing_stats['current'] = 0
+    processing_stats['valid_count'] = 0
+    processing_stats['bounced_count'] = 0
+    processing_stats['error_count'] = 0
+
+    # Clear previous results
+    valid_emails[:] = []
+    bounced_emails[:] = []
+    error_emails[:] = []
+
+    print(f"🚀 Starting controlled concurrency processing of {len(emails)} emails...")
+    print(f"⚙️ Using {MAX_WORKERS} workers with {REQUEST_DELAY}s delay")
+    
+    # Use ThreadPoolExecutor with limited workers
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all emails for processing
+        future_to_email = {
+            executor.submit(check_single_email_controlled, email): email 
+            for email in emails
+        }
+        
+        # Process completed results
+        for future in future_to_email:
+            email = future_to_email[future]
+            
+            try:
+                status, message = future.result()
+                
+                # Update progress
+                processing_stats['current'] += 1
+                processing_stats['current_email'] = email
+                
+                print(f"📧 Completed {processing_stats['current']}/{len(emails)}: {email} - {status}")
+
+                # Emit progress update
+                socketio.emit('progress', {
+                    'current': processing_stats['current'],
+                    'total': processing_stats['total'],
+                    'currentEmail': email,
+                    'percentage': round((processing_stats['current'] / processing_stats['total']) * 100, 1)
+                })
+
+                # Store result
+                result = {
+                    'email': email,
+                    'status': status,
+                    'message': message,
+                    'timestamp': time.time()
+                }
+
+                # Add to appropriate list
+                if status == 'valid':
+                    valid_emails.append(result)
+                    processing_stats['valid_count'] += 1
+                elif status == 'bounced':
+                    bounced_emails.append(result)
+                    processing_stats['bounced_count'] += 1
+                else:
+                    error_emails.append(result)
+                    processing_stats['error_count'] += 1
+
+                # Emit result to frontend
+                socketio.emit('result', result)
+                
+            except Exception as e:
+                print(f"❌ Error processing {email}: {e}")
+                # Handle as error
+                result = {
+                    'email': email,
+                    'status': 'error',
+                    'message': f"⚠️ Processing failed: {str(e)[:50]}",
+                    'timestamp': time.time()
+                }
+                error_emails.append(result)
+                processing_stats['error_count'] += 1
+                socketio.emit('result', result)
+
+    processing_stats['is_processing'] = False
+    processing_stats['current_email'] = 'Completed!'
+
+    # Emit completion
+    socketio.emit('processing_complete', {
+        'total_processed': len(emails),
+        'valid_count': processing_stats['valid_count'],
+        'bounced_count': processing_stats['bounced_count'],
+        'error_count': processing_stats['error_count']
+    })
+    
+    print("✅ Final counts:")
+    print("Total processed:", len(emails))
+    print("Valid:", processing_stats['valid_count'])
+    print("Bounced:", processing_stats['bounced_count'])
+    print("Error:", processing_stats['error_count'])
 @app.route('/')
 def index():
     """Serve the main page"""
@@ -264,7 +379,7 @@ def upload_emails():
 
         # Start processing in background
         socketio.start_background_task(
-            target=process_emails_synchronously, emails=unique_emails)
+            target=process_emails_controlled_concurrency, emails=unique_emails)
 
         return jsonify({
             'message': 'Processing started',
@@ -353,6 +468,7 @@ if __name__ == '__main__':
     print("Starting Gmail Email Checker Server (Synchronous Mode)...")
     print("Frontend should be running on http://localhost:5173")
     print("Backend API running on http://localhost:5000")
-    print("📧 Processing emails synchronously for consistent results")
+    print("📧 Processing emails with controlled concurrency (3 workers)")
+    print("⚙️ This balances speed with reliability")
     
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)
